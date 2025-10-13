@@ -5,11 +5,18 @@ pub fn build(b: *std.Build) void {
 
     const optimize = b.standardOptimizeOption(.{});
 
+    const lmdbx_dep = b.dependency("lmdbx", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     const mod = b.addModule("antarys_edge", .{
         .root_source_file = b.path("src/root.zig"),
 
         .target = target,
     });
+
+    mod.addImport("cache", lmdbx_dep.module("lmdbx"));
 
     const exe = b.addExecutable(.{
         .name = "antarys_edge",
@@ -24,6 +31,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+
+    exe.root_module.addImport("lmdbx", lmdbx_dep.module("lmdbx"));
 
     const usearch_module = b.createModule(.{
         .target = target,

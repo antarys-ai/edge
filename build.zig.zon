@@ -3,7 +3,12 @@
     .version = "0.0.0",
     .fingerprint = 0x8a08c3293feaffbc,
     .minimum_zig_version = "0.15.1",
-    .dependencies = .{},
+    .dependencies = .{
+        .lmdbx = .{
+            .url = "git+https://github.com/pacifio/lmdbx-zig.git#2b118ef67e32d4e6ae937eb65918fffc9d7bd3ac",
+            .hash = "lmdbx-0.2.3-WlIvzgVgAwAmL75534IWDRMr3dz52_b89OTJV-6ABKam",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",
