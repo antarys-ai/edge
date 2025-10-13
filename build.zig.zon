@@ -3,7 +3,12 @@
     .version = "0.0.0",
     .fingerprint = 0x8a08c3293feaffbc,
     .minimum_zig_version = "0.15.1",
-    .dependencies = .{},
+    .dependencies = .{
+        .rocksdb = .{
+            .url = "https://github.com/Syndica/rocksdb-zig/archive/c4e2a44.tar.gz",
+            .hash = "rocksdb-9.7.4-z_CUThG5AADJl5KzxoqbR6kLKYb7Gmxi5IAcac4JjRRo",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

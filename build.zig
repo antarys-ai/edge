@@ -25,6 +25,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const bindings = b.dependency("rocksdb", .{}).module("bindings");
+    exe.root_module.addImport("rocksdb", bindings);
+
     const usearch_module = b.createModule(.{
         .target = target,
         .optimize = optimize,
