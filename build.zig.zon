@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.15.1",
     .dependencies = .{
         .rocksdb = .{
-            .url = "https://github.com/Syndica/rocksdb-zig/archive/c4e2a44.tar.gz",
-            .hash = "rocksdb-9.7.4-z_CUThG5AADJl5KzxoqbR6kLKYb7Gmxi5IAcac4JjRRo",
+            .url = "git+https://github.com/pacifio/rocksdb.git/?ref=main#f0a5ee2a74060b877a9c3b5d516a7f2dd84a742f",
+            .hash = "rocksdb-9.8.0-z_CUTp64AAC9RVaFcmhqWMFIukXHjlNHGs1iZnFcE8xr",
         },
     },
     .paths = .{
