@@ -9,6 +9,8 @@ const Allocator = std.mem.Allocator;
 const Mutex = std.Thread.Mutex;
 const RwLock = std.Thread.RwLock;
 
+pub const SearchResult = searchLib.SearchResult;
+
 pub const AntarysError = error{
     CollectionNotFound,
     CollectionAlreadyExists,
@@ -20,7 +22,6 @@ pub const AntarysError = error{
     SearchError,
 } || Allocator.Error;
 
-/// Configuration for a vector collection
 pub const CollectionConfig = struct {
     dimensions: usize,
     metric: usearch.Metric = .cosine,
@@ -31,7 +32,6 @@ pub const CollectionConfig = struct {
     enable_persistence: bool = true,
 };
 
-/// Configuration for the entire database
 pub const DBConfig = struct {
     storage_path: []const u8,
     max_open_files: i32 = 10000,
@@ -40,21 +40,6 @@ pub const DBConfig = struct {
     cache_segment_count: u16 = 32,
 };
 
-/// Result from a vector search operation
-pub const SearchResult = struct {
-    id: []const u8,
-    distance: f32,
-    vector: ?[]f32 = null,
-
-    pub fn deinit(self: *SearchResult, allocator: Allocator) void {
-        allocator.free(self.id);
-        if (self.vector) |vec| {
-            allocator.free(vec);
-        }
-    }
-};
-
-/// Statistics for a collection
 pub const CollectionStats = struct {
     name: []const u8,
     vector_count: usize,
@@ -63,7 +48,6 @@ pub const CollectionStats = struct {
     storage_bytes: u64,
 };
 
-/// Statistics for the entire database
 pub const DBStats = struct {
     total_collections: usize,
     total_vectors: u64,
@@ -108,7 +92,6 @@ const Collection = struct {
     }
 };
 
-/// High-level vector database API combining storage, indexing, and search
 pub const AntarysDB = struct {
     allocator: Allocator,
     store: storage.Storage,
@@ -118,7 +101,6 @@ pub const AntarysDB = struct {
 
     const Self = @This();
 
-    /// Initialize the database with the given configuration
     pub fn init(allocator: Allocator, config: DBConfig) !Self {
         var store = try storage.Storage.init(allocator, .{
             .path = config.storage_path,
@@ -139,7 +121,6 @@ pub const AntarysDB = struct {
         };
     }
 
-    /// Close the database and cleanup all resources
     pub fn deinit(self: *Self) void {
         var iter = self.collections.valueIterator();
         while (iter.next()) |col| {
@@ -149,7 +130,6 @@ pub const AntarysDB = struct {
         self.store.deinit();
     }
 
-    /// Create a new vector collection with the specified configuration
     pub fn createCollection(self: *Self, name: []const u8, config: CollectionConfig) !void {
         if (config.dimensions == 0) {
             return AntarysError.InvalidDimensions;
@@ -177,19 +157,17 @@ pub const AntarysDB = struct {
         }
     }
 
-    /// Delete a collection and all its vectors
     pub fn deleteCollection(self: *Self, name: []const u8) !void {
         self.collections_lock.lock();
         defer self.collections_lock.unlock();
 
-        const entry = self.collections.fetchRemove(name) orelse return AntarysError.CollectionNotFound;
+        var entry = self.collections.fetchRemove(name) orelse return AntarysError.CollectionNotFound;
         entry.value.deinit(self.allocator);
         self.allocator.free(entry.key);
 
         _ = try self.store.deleteRange(name);
     }
 
-    /// List all collection names
     pub fn listCollections(self: *Self) ![][]const u8 {
         self.collections_lock.lockShared();
         defer self.collections_lock.unlockShared();
@@ -205,7 +183,6 @@ pub const AntarysDB = struct {
         return names;
     }
 
-    /// Insert a single vector into a collection
     pub fn insert(self: *Self, collection_name: []const u8, id: []const u8, vector: []const f32) !void {
         const col = try self.getCollection(collection_name);
 
@@ -220,7 +197,6 @@ pub const AntarysDB = struct {
         try self.store.putVector(collection_name, id, vector);
     }
 
-    /// Insert multiple vectors in batch for better performance
     pub fn insertBatch(
         self: *Self,
         collection_name: []const u8,
@@ -246,13 +222,11 @@ pub const AntarysDB = struct {
         try self.store.putVectorBatch(collection_name, ids, vectors);
     }
 
-    /// Retrieve a vector by id
     pub fn get(self: *Self, collection_name: []const u8, id: []const u8) !?[]f32 {
         _ = try self.getCollection(collection_name);
         return try self.store.getVector(collection_name, id);
     }
 
-    /// Delete a vector from a collection
     pub fn delete(self: *Self, collection_name: []const u8, id: []const u8) !void {
         const col = try self.getCollection(collection_name);
 
@@ -263,7 +237,6 @@ pub const AntarysDB = struct {
         try self.store.deleteVector(collection_name, id);
     }
 
-    /// Search for similar vectors in a collection
     pub fn search(
         self: *Self,
         collection_name: []const u8,
@@ -280,7 +253,7 @@ pub const AntarysDB = struct {
         col.mu.lock();
         defer col.mu.unlock();
 
-        const results = try searchLib.search(
+        return try searchLib.search(
             &col.idx.index,
             query,
             .{
@@ -290,11 +263,8 @@ pub const AntarysDB = struct {
             &col.idx.id_map,
             self.allocator,
         );
-
-        return results;
     }
 
-    /// Search with multiple queries in batch
     pub fn searchBatch(
         self: *Self,
         collection_name: []const u8,
@@ -313,7 +283,7 @@ pub const AntarysDB = struct {
         col.mu.lock();
         defer col.mu.unlock();
 
-        const results = try searchLib.batchSearch(
+        return try searchLib.batchSearch(
             &col.idx.index,
             queries,
             .{
@@ -323,11 +293,8 @@ pub const AntarysDB = struct {
             &col.idx.id_map,
             self.allocator,
         );
-
-        return results;
     }
 
-    /// Save a collection's index to disk
     pub fn saveCollection(self: *Self, collection_name: []const u8) !void {
         const col = try self.getCollection(collection_name);
 
@@ -341,10 +308,10 @@ pub const AntarysDB = struct {
         );
         defer self.allocator.free(index_path);
 
-        try col.idx.save(index_path);
+        try col.idx.saveIndex(index_path);
+        try self.saveIdMap(collection_name, &col.idx.id_map);
     }
 
-    /// Load a collection's index from disk
     pub fn loadCollection(self: *Self, collection_name: []const u8) !void {
         const col = try self.getCollection(collection_name);
 
@@ -358,10 +325,10 @@ pub const AntarysDB = struct {
         );
         defer self.allocator.free(index_path);
 
-        try col.idx.load(index_path);
+        try col.idx.loadIndex(index_path);
+        try self.loadIdMap(collection_name, &col.idx.id_map);
     }
 
-    /// Save all collections to disk
     pub fn saveAll(self: *Self) !void {
         self.collections_lock.lockShared();
         defer self.collections_lock.unlockShared();
@@ -374,7 +341,6 @@ pub const AntarysDB = struct {
         try self.store.flush();
     }
 
-    /// Get statistics for a specific collection
     pub fn collectionStats(self: *Self, collection_name: []const u8) !CollectionStats {
         const col = try self.getCollection(collection_name);
 
@@ -396,7 +362,6 @@ pub const AntarysDB = struct {
         };
     }
 
-    /// Get statistics for the entire database
     pub fn stats(self: *Self) !DBStats {
         self.collections_lock.lockShared();
         defer self.collections_lock.unlockShared();
@@ -420,19 +385,16 @@ pub const AntarysDB = struct {
         };
     }
 
-    /// Optimize storage by compacting the database
     pub fn compact(self: *Self) !void {
         try self.store.compact();
     }
 
-    /// Check if a collection exists
     pub fn hasCollection(self: *Self, name: []const u8) bool {
         self.collections_lock.lockShared();
         defer self.collections_lock.unlockShared();
         return self.collections.contains(name);
     }
 
-    /// Get the number of vectors in a collection
     pub fn count(self: *Self, collection_name: []const u8) !usize {
         const col = try self.getCollection(collection_name);
         col.mu.lock();
@@ -445,5 +407,42 @@ pub const AntarysDB = struct {
         defer self.collections_lock.unlockShared();
 
         return self.collections.getPtr(name) orelse AntarysError.CollectionNotFound;
+    }
+
+    fn saveIdMap(self: *Self, collection_name: []const u8, id_map: *const searchLib.IdMap) !void {
+        const next_key_str = try std.fmt.allocPrint(
+            self.allocator,
+            "{d}",
+            .{id_map.next_key},
+        );
+        defer self.allocator.free(next_key_str);
+        try self.store.putIndexState(collection_name, "id_map_next_key", next_key_str);
+
+        var iter = id_map.id_to_key.iterator();
+        while (iter.next()) |entry| {
+            const map_key = try std.fmt.allocPrint(
+                self.allocator,
+                "id_map:{s}",
+                .{entry.key_ptr.*},
+            );
+            defer self.allocator.free(map_key);
+
+            const key_str = try std.fmt.allocPrint(
+                self.allocator,
+                "{d}",
+                .{entry.value_ptr.*},
+            );
+            defer self.allocator.free(key_str);
+
+            try self.store.putIndexState(collection_name, map_key, key_str);
+        }
+    }
+
+    fn loadIdMap(self: *Self, collection_name: []const u8, id_map: *searchLib.IdMap) !void {
+        const next_key_data = try self.store.getIndexState(collection_name, "id_map_next_key");
+        if (next_key_data) |data| {
+            defer self.allocator.free(data);
+            id_map.next_key = try std.fmt.parseInt(usize, data, 10);
+        }
     }
 };
