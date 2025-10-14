@@ -30,6 +30,8 @@ pub const CollectionConfig = struct {
     expansion_add: usize = 128,
     expansion_search: usize = 64,
     enable_persistence: bool = true,
+    threads_add: ?usize = null,
+    threads_search: ?usize = null,
 };
 
 pub const DBConfig = struct {
@@ -81,6 +83,8 @@ const Collection = struct {
                 .expansion_add = config.expansion_add,
                 .expansion_search = config.expansion_search,
                 .initial_capacity = 100_000,
+                .threads_add = config.threads_add,
+                .threads_search = config.threads_search,
             }),
             .mu = .{},
         };
@@ -122,9 +126,10 @@ pub const AntarysDB = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        var iter = self.collections.valueIterator();
-        while (iter.next()) |col| {
-            col.deinit(self.allocator);
+        var iter = self.collections.iterator();
+        while (iter.next()) |entry| {
+            entry.value_ptr.deinit(self.allocator);
+            self.allocator.free(entry.key_ptr.*);
         }
         self.collections.deinit();
         self.store.deinit();
@@ -190,9 +195,6 @@ pub const AntarysDB = struct {
             return AntarysError.InvalidDimensions;
         }
 
-        col.mu.lock();
-        defer col.mu.unlock();
-
         try col.idx.add(id, vector);
         try self.store.putVector(collection_name, id, vector);
     }
@@ -215,9 +217,6 @@ pub const AntarysDB = struct {
             }
         }
 
-        col.mu.lock();
-        defer col.mu.unlock();
-
         try col.idx.addBatch(ids, vectors);
         try self.store.putVectorBatch(collection_name, ids, vectors);
     }
@@ -229,9 +228,6 @@ pub const AntarysDB = struct {
 
     pub fn delete(self: *Self, collection_name: []const u8, id: []const u8) !void {
         const col = try self.getCollection(collection_name);
-
-        col.mu.lock();
-        defer col.mu.unlock();
 
         try col.idx.remove(id);
         try self.store.deleteVector(collection_name, id);
@@ -397,8 +393,6 @@ pub const AntarysDB = struct {
 
     pub fn count(self: *Self, collection_name: []const u8) !usize {
         const col = try self.getCollection(collection_name);
-        col.mu.lock();
-        defer col.mu.unlock();
         return col.idx.len();
     }
 

@@ -2,6 +2,11 @@ const std = @import("std");
 const usearch = @import("usearch.zig");
 const search = @import("search.zig");
 
+fn detectCPUCores() usize {
+    const cores = std.Thread.getCpuCount() catch 4;
+    return @min(cores, 8);
+}
+
 pub const IndexConfig = struct {
     dimensions: usize,
     metric: usearch.Metric = .cosine,
@@ -10,6 +15,24 @@ pub const IndexConfig = struct {
     expansion_add: usize = 128,
     expansion_search: usize = 64,
     initial_capacity: usize = 100_000,
+    threads_add: ?usize = null,
+    threads_search: ?usize = null,
+
+    pub fn getThreadsAdd(self: IndexConfig) usize {
+        if (self.threads_add) |t| {
+            if (t == 0) return detectCPUCores();
+            return t;
+        }
+        return detectCPUCores();
+    }
+
+    pub fn getThreadsSearch(self: IndexConfig) usize {
+        if (self.threads_search) |t| {
+            if (t == 0) return @max(1, detectCPUCores() / 2);
+            return t;
+        }
+        return @max(1, detectCPUCores() / 2);
+    }
 };
 
 pub const IndexError = error{
@@ -30,6 +53,8 @@ pub const VectorIndex = struct {
     allocator: std.mem.Allocator,
     mu: std.Thread.Mutex,
 
+    const Self = @This();
+
     pub fn init(allocator: std.mem.Allocator, config: IndexConfig) IndexError!VectorIndex {
         if (config.dimensions == 0) return IndexError.InvalidConfig;
 
@@ -43,8 +68,21 @@ pub const VectorIndex = struct {
             .initial_capacity = config.initial_capacity,
         };
 
-        const idx = usearch.Index.init(allocator, uconfig) catch {
+        var idx = usearch.Index.init(allocator, uconfig) catch {
             return IndexError.InitFailed;
+        };
+
+        const threads_add = config.getThreadsAdd();
+        const threads_search = config.getThreadsSearch();
+
+        std.debug.print("[INDEX] Configuring multi-threading: add={d} threads, search={d} threads\n", .{ threads_add, threads_search });
+
+        idx.setThreadsAdd(threads_add) catch |err| {
+            std.debug.print("[INDEX] Warning: Failed to set threads_add: {}\n", .{err});
+        };
+
+        idx.setThreadsSearch(threads_search) catch |err| {
+            std.debug.print("[INDEX] Warning: Failed to set threads_search: {}\n", .{err});
         };
 
         return .{
@@ -67,11 +105,11 @@ pub const VectorIndex = struct {
         }
 
         self.mu.lock();
-        defer self.mu.unlock();
-
         const key = self.id_map.getOrCreate(id) catch {
+            self.mu.unlock();
             return IndexError.OutOfMemory;
         };
+        self.mu.unlock();
 
         self.index.add(key, vector) catch {
             return IndexError.AddFailed;
@@ -80,10 +118,41 @@ pub const VectorIndex = struct {
 
     pub fn addBatch(self: *VectorIndex, ids: []const []const u8, vectors: []const []const f32) IndexError!void {
         if (ids.len != vectors.len) return IndexError.InvalidConfig;
+        if (ids.len == 0) return;
 
-        for (ids, vectors) |id, vec| {
-            try self.add(id, vec);
+        for (vectors) |vec| {
+            if (vec.len != self.config.dimensions) {
+                return IndexError.DimensionMismatch;
+            }
         }
+
+        std.debug.print("[INDEX] Starting batch add of {d} vectors...\n", .{ids.len});
+
+        const keys = self.allocator.alloc(u64, ids.len) catch {
+            return IndexError.OutOfMemory;
+        };
+        defer self.allocator.free(keys);
+
+        self.mu.lock();
+        for (ids, 0..) |id, i| {
+            keys[i] = self.id_map.getOrCreate(id) catch {
+                self.mu.unlock();
+                return IndexError.OutOfMemory;
+            };
+        }
+        self.mu.unlock();
+
+        for (keys, vectors, 0..) |key, vec, i| {
+            self.index.add(key, vec) catch {
+                return IndexError.AddFailed;
+            };
+
+            if ((i + 1) % 1000 == 0) {
+                std.debug.print("[INDEX] Added {d}/{d} vectors to index\n", .{ i + 1, ids.len });
+            }
+        }
+
+        std.debug.print("[INDEX] Completed batch add\n", .{});
     }
 
     pub fn remove(self: *VectorIndex, id: []const u8) IndexError!void {
@@ -101,9 +170,12 @@ pub const VectorIndex = struct {
 
     pub fn get(self: *VectorIndex, id: []const u8) IndexError!?[]f32 {
         self.mu.lock();
-        defer self.mu.unlock();
+        const key = self.id_map.getKey(id) orelse {
+            self.mu.unlock();
+            return null;
+        };
+        self.mu.unlock();
 
-        const key = self.id_map.getKey(id) orelse return null;
         return self.index.get(key, 1) catch null;
     }
 
@@ -116,23 +188,14 @@ pub const VectorIndex = struct {
     }
 
     pub fn len(self: *VectorIndex) usize {
-        self.mu.lock();
-        defer self.mu.unlock();
-
         return self.index.len() catch 0;
     }
 
     pub fn capacity(self: *VectorIndex) usize {
-        self.mu.lock();
-        defer self.mu.unlock();
-
         return self.index.capacity() catch 0;
     }
 
     pub fn memoryUsage(self: *VectorIndex) usize {
-        self.mu.lock();
-        defer self.mu.unlock();
-
         return self.index.memoryUsage() catch 0;
     }
 
@@ -155,27 +218,18 @@ pub const VectorIndex = struct {
     }
 
     pub fn reserve(self: *VectorIndex, cap: usize) IndexError!void {
-        self.mu.lock();
-        defer self.mu.unlock();
-
         self.index.reserve(cap) catch {
             return IndexError.InitFailed;
         };
     }
 
     pub fn setExpansionAdd(self: *VectorIndex, expansion: usize) IndexError!void {
-        self.mu.lock();
-        defer self.mu.unlock();
-
         self.index.setExpansionAdd(expansion) catch {
             return IndexError.InitFailed;
         };
     }
 
     pub fn setExpansionSearch(self: *VectorIndex, expansion: usize) IndexError!void {
-        self.mu.lock();
-        defer self.mu.unlock();
-
         self.index.setExpansionSearch(expansion) catch {
             return IndexError.InitFailed;
         };

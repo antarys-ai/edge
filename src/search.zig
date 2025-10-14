@@ -18,6 +18,16 @@ pub const SearchOptions = struct {
     limit: usize = 10,
     include_vectors: bool = false,
     filter: ?*const fn (key: u64) bool = null,
+    threads: ?usize = null,
+    expansion: ?usize = null,
+
+    pub fn getThreads(self: SearchOptions) ?usize {
+        return self.threads;
+    }
+
+    pub fn getExpansion(self: SearchOptions) ?usize {
+        return self.expansion;
+    }
 };
 
 pub const SearchError = error{
@@ -29,13 +39,21 @@ pub const SearchError = error{
 };
 
 pub fn search(
-    index: *const usearch.Index,
+    index: *usearch.Index,
     query: []const f32,
     options: SearchOptions,
     id_map: *const IdMap,
     allocator: std.mem.Allocator,
 ) SearchError![]SearchResult {
     if (query.len == 0) return SearchError.EmptyQuery;
+
+    if (options.expansion) |exp| {
+        index.setExpansionSearch(exp) catch {};
+    }
+
+    if (options.threads) |threads| {
+        index.setThreadsSearch(threads) catch {};
+    }
 
     const raw_results = index.search(query, options.limit) catch |err| {
         return switch (err) {

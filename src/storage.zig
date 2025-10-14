@@ -10,7 +10,6 @@ const WriteBatch = rocksdb.WriteBatch;
 const ColumnFamilyHandle = rocksdb.ColumnFamilyHandle;
 const Iterator = rocksdb.Iterator;
 
-/// Configuration for the storage layer optimized for vector workloads
 pub const StorageConfig = struct {
     path: []const u8,
     max_open_files: i32 = 10000,
@@ -18,10 +17,9 @@ pub const StorageConfig = struct {
     cache_size: u32 = 500_000,
     cache_segment_count: u16 = 32,
     cache_ttl: u32 = 3600,
-    batch_buffer_size: usize = 10_000,
+    batch_buffer_size: usize = 50_000,
 };
 
-/// Metadata associated with each vector
 pub const VectorMetadata = struct {
     dimensions: usize,
     timestamp: i64,
@@ -95,7 +93,6 @@ pub const StorageError = error{
     InvalidKey,
 } || Allocator.Error;
 
-/// Storage layer for vectors using RocksDB
 pub const Storage = struct {
     db: ?DB,
     vectors_cf: ?ColumnFamilyHandle,
@@ -108,7 +105,6 @@ pub const Storage = struct {
 
     const Self = @This();
 
-    /// Initialize storage (does not open database yet)
     pub fn init(allocator: Allocator, config: StorageConfig) !Self {
         var vector_cache: ?*cache.Cache(CachedVector) = null;
 
@@ -135,7 +131,6 @@ pub const Storage = struct {
         };
     }
 
-    /// Open the database and initialize column families
     pub fn open(self: *Self) !void {
         var err_str: ?Data = null;
         defer if (err_str) |e| e.deinit();
@@ -165,7 +160,6 @@ pub const Storage = struct {
         self.allocator.free(families);
     }
 
-    /// Close database and cleanup resources
     pub fn deinit(self: *Self) void {
         if (self.vector_cache) |cache_ptr| {
             cache_ptr.deinit();
@@ -177,7 +171,6 @@ pub const Storage = struct {
         }
     }
 
-    /// Store a single vector with metadata
     pub fn putVector(
         self: *Self,
         collection: []const u8,
@@ -228,7 +221,6 @@ pub const Storage = struct {
         try db.put(self.metadata_cf, key, metadata_bytes, &err_str);
     }
 
-    /// Retrieve a vector by collection and id
     pub fn getVector(
         self: *Self,
         collection: []const u8,
@@ -274,7 +266,6 @@ pub const Storage = struct {
         return vector;
     }
 
-    /// Get metadata for a vector
     pub fn getMetadata(
         self: *Self,
         collection: []const u8,
@@ -296,7 +287,6 @@ pub const Storage = struct {
         return try VectorMetadata.deserialize(self.allocator, result.?.data);
     }
 
-    /// Delete a vector and its metadata
     pub fn deleteVector(
         self: *Self,
         collection: []const u8,
@@ -320,7 +310,6 @@ pub const Storage = struct {
         }
     }
 
-    /// Batch insert vectors for maximum throughput
     pub fn putVectorBatch(
         self: *Self,
         collection: []const u8,
@@ -332,38 +321,38 @@ pub const Storage = struct {
 
         const db = self.db orelse return StorageError.DatabaseNotInitialized;
 
-        const chunk_size = self.config.batch_buffer_size;
-        var offset: usize = 0;
+        std.debug.print("[STORAGE] Starting batch write of {d} vectors...\n", .{ids.len});
 
-        while (offset < ids.len) {
-            const end = @min(offset + chunk_size, ids.len);
-            try self.putVectorBatchChunk(db, collection, ids[offset..end], vectors[offset..end]);
-            offset = end;
-
-            if (offset % (chunk_size * 10) == 0) {
-                try self.flush();
-            }
-        }
-    }
-
-    fn putVectorBatchChunk(
-        self: *Self,
-        db: DB,
-        collection: []const u8,
-        ids: []const []const u8,
-        vectors: []const []const f32,
-    ) !void {
         var batch = WriteBatch.init();
         defer batch.deinit();
 
         const timestamp = std.time.timestamp();
 
-        for (ids, vectors) |id, vector| {
+        var keys = try std.ArrayList([]u8).initCapacity(self.allocator, ids.len);
+        defer {
+            for (keys.items) |key| self.allocator.free(key);
+            keys.deinit(self.allocator);
+        }
+
+        var vector_bytes_list = try std.ArrayList([]u8).initCapacity(self.allocator, ids.len);
+        defer {
+            for (vector_bytes_list.items) |vb| self.allocator.free(vb);
+            vector_bytes_list.deinit(self.allocator);
+        }
+
+        var metadata_bytes_list = try std.ArrayList([]u8).initCapacity(self.allocator, ids.len);
+        defer {
+            for (metadata_bytes_list.items) |mb| self.allocator.free(mb);
+            metadata_bytes_list.deinit(self.allocator);
+        }
+
+        std.debug.print("[STORAGE] Building WriteBatch...\n", .{});
+        for (ids, vectors, 0..) |id, vector, i| {
             const key = try internals.encodeKey(self.allocator, collection, id);
-            defer self.allocator.free(key);
+            try keys.append(self.allocator, key);
 
             const vector_bytes = try internals.serializeVector(self.allocator, vector);
-            defer self.allocator.free(vector_bytes);
+            try vector_bytes_list.append(self.allocator, vector_bytes);
 
             batch.put(self.vectors_cf.?, key, vector_bytes);
 
@@ -373,20 +362,26 @@ pub const Storage = struct {
                 .collection = collection,
             };
             const metadata_bytes = try metadata.serialize(self.allocator);
-            defer self.allocator.free(metadata_bytes);
+            try metadata_bytes_list.append(self.allocator, metadata_bytes);
 
             batch.put(self.metadata_cf.?, key, metadata_bytes);
 
             self.metrics.recordInsert();
+
+            if ((i + 1) % 2000 == 0) {
+                std.debug.print("[STORAGE] Prepared {d}/{d} vectors\n", .{ i + 1, ids.len });
+            }
         }
+
+        std.debug.print("[STORAGE] Writing batch to RocksDB...\n", .{});
 
         var err_str: ?Data = null;
         defer if (err_str) |e| e.deinit();
 
         try db.write(batch, &err_str);
+        std.debug.print("[STORAGE] Batch write completed\n", .{});
     }
 
-    /// Delete a range of vectors by collection prefix
     pub fn deleteRange(
         self: *Self,
         collection: []const u8,
@@ -433,7 +428,6 @@ pub const Storage = struct {
         return count;
     }
 
-    /// Iterator for scanning vectors in a collection
     pub const VectorIterator = struct {
         storage: *Self,
         iter: Iterator,
@@ -469,7 +463,6 @@ pub const Storage = struct {
         }
     };
 
-    /// Create an iterator for scanning all vectors in a collection
     pub fn iterateCollection(
         self: *Self,
         collection: []const u8,
@@ -487,7 +480,6 @@ pub const Storage = struct {
         };
     }
 
-    /// Flush all pending writes to disk
     pub fn flush(self: *Self) !void {
         const db = self.db orelse return StorageError.DatabaseNotInitialized;
 
@@ -498,7 +490,6 @@ pub const Storage = struct {
         try db.flush(self.metadata_cf, &err_str);
     }
 
-    /// Get storage statistics
     pub fn getStats(self: *Self) !StorageStats {
         const db = self.db orelse return StorageError.DatabaseNotInitialized;
 
@@ -520,7 +511,6 @@ pub const Storage = struct {
         };
     }
 
-    /// Compact the database to optimize storage
     pub fn compact(self: *Self) !void {
         const db = self.db orelse return StorageError.DatabaseNotInitialized;
 
@@ -530,7 +520,6 @@ pub const Storage = struct {
         try db.deleteFilesInRange(self.vectors_cf, "", "~", &err_str);
     }
 
-    /// Store index state for persisting USearch index metadata
     pub fn putIndexState(
         self: *Self,
         collection: []const u8,
@@ -548,7 +537,6 @@ pub const Storage = struct {
         try db.put(self.index_state_cf, key, state_data, &err_str);
     }
 
-    /// Retrieve index state
     pub fn getIndexState(
         self: *Self,
         collection: []const u8,
