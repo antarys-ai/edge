@@ -4,6 +4,8 @@ const rocksdb = @import("rocksdb");
 const index = @import("index.zig");
 const search = @import("search.zig");
 const internals = @import("internals.zig");
+const storageLib = @import("storage.zig");
+const vectordb = @import("vectordb.zig");
 
 const testing = std.testing;
 const allocator = testing.allocator;
@@ -11,11 +13,20 @@ const allocator = testing.allocator;
 const DB = rocksdb.DB;
 const Data = rocksdb.Data;
 const WriteBatch = rocksdb.WriteBatch;
+const Storage = storageLib.Storage;
+
+const AntarysDB = vectordb.AntarysDB;
+const CollectionConfig = vectordb.CollectionConfig;
+const DBConfig = vectordb.DBConfig;
 
 const TEST_COLLECTION = "test_vectors";
 const TEST_DIMENSIONS = 128;
 
 pub fn main() !void {}
+
+fn cleanupTestDB(path: []const u8) void {
+    std.fs.cwd().deleteTree(path) catch {};
+}
 
 fn generateRandomVector(alloc: std.mem.Allocator, dims: usize, seed: f32) ![]f32 {
     const vec = try alloc.alloc(f32, dims);
@@ -737,4 +748,223 @@ test "index: batch add" {
 
     try idx.addBatch(ids.items, vectors.items);
     try testing.expectEqual(@as(usize, 10), idx.len());
+}
+
+test "storage: basic vector operations" {
+    const source_file = @src().file;
+    const dir_path = std.fs.path.dirname(source_file) orelse ".";
+    const db_path = try std.fs.path.join(allocator, &.{ dir_path, ".test-storage-basic" });
+    defer allocator.free(db_path);
+
+    std.fs.cwd().deleteTree(db_path) catch {};
+    defer std.fs.cwd().deleteTree(db_path) catch {};
+
+    var storage = try Storage.init(allocator, .{
+        .path = db_path,
+        .enable_cache = true,
+        .cache_size = 1000,
+    });
+    defer storage.deinit();
+
+    try storage.open();
+
+    const vec1 = [_]f32{ 1.0, 2.0, 3.0, 4.0, 5.0 };
+    try storage.putVector("test_collection", "vec1", &vec1);
+
+    const retrieved = try storage.getVector("test_collection", "vec1");
+    try testing.expect(retrieved != null);
+    defer allocator.free(retrieved.?);
+
+    try testing.expectEqual(@as(usize, 5), retrieved.?.len);
+    for (vec1, retrieved.?) |expected, actual| {
+        try testing.expectApproxEqAbs(expected, actual, 0.001);
+    }
+
+    var metadata = try storage.getMetadata("test_collection", "vec1");
+    try testing.expect(metadata != null);
+    defer if (metadata) |*m| m.deinit(allocator);
+
+    try testing.expectEqual(@as(usize, 5), metadata.?.dimensions);
+
+    try storage.deleteVector("test_collection", "vec1");
+    const deleted = try storage.getVector("test_collection", "vec1");
+    try testing.expect(deleted == null);
+}
+
+test "storage: batch operations" {
+    const source_file = @src().file;
+    const dir_path = std.fs.path.dirname(source_file) orelse ".";
+    const db_path = try std.fs.path.join(allocator, &.{ dir_path, ".test-storage-batch" });
+    defer allocator.free(db_path);
+
+    std.fs.cwd().deleteTree(db_path) catch {};
+    defer std.fs.cwd().deleteTree(db_path) catch {};
+
+    var storage = try Storage.init(allocator, .{
+        .path = db_path,
+        .enable_cache = false,
+        .batch_buffer_size = 100,
+    });
+    defer storage.deinit();
+
+    try storage.open();
+
+    const batch_size = 1000;
+    var ids = try std.ArrayList([]const u8).initCapacity(allocator, batch_size);
+    defer {
+        for (ids.items) |id| allocator.free(id);
+        ids.deinit(allocator);
+    }
+
+    var vectors = try std.ArrayList([]const f32).initCapacity(allocator, batch_size);
+    defer {
+        for (vectors.items) |vec| allocator.free(vec);
+        vectors.deinit(allocator);
+    }
+
+    for (0..batch_size) |i| {
+        const id = try std.fmt.allocPrint(allocator, "vec_{d}", .{i});
+        try ids.append(allocator, id);
+
+        const vec = try allocator.alloc(f32, 128);
+        for (vec, 0..) |*v, j| {
+            v.* = @as(f32, @floatFromInt(i + j));
+        }
+        try vectors.append(allocator, vec);
+    }
+
+    try storage.putVectorBatch("bench_collection", ids.items, vectors.items);
+    try storage.flush();
+
+    for (0..10) |i| {
+        const idx = i * 100;
+        const id = try std.fmt.allocPrint(allocator, "vec_{d}", .{idx});
+        defer allocator.free(id);
+
+        const retrieved = try storage.getVector("bench_collection", id);
+        try testing.expect(retrieved != null);
+        defer allocator.free(retrieved.?);
+
+        try testing.expectEqual(@as(usize, 128), retrieved.?.len);
+    }
+
+    const stats = try storage.getStats();
+    std.debug.print("\nBatch test stats:\n", .{});
+    std.debug.print("  Vectors: {d}\n", .{stats.estimated_vectors});
+    std.debug.print("  Size: {d} bytes\n", .{stats.total_size_bytes});
+    std.debug.print("  Inserts: {d}\n", .{stats.insert_count});
+}
+
+test "storage: collection iteration" {
+    const source_file = @src().file;
+    const dir_path = std.fs.path.dirname(source_file) orelse ".";
+    const db_path = try std.fs.path.join(allocator, &.{ dir_path, ".test-storage-iter" });
+    defer allocator.free(db_path);
+
+    std.fs.cwd().deleteTree(db_path) catch {};
+    defer std.fs.cwd().deleteTree(db_path) catch {};
+
+    var storage = try Storage.init(allocator, .{ .path = db_path });
+    defer storage.deinit();
+
+    try storage.open();
+
+    for (0..50) |i| {
+        const id = try std.fmt.allocPrint(allocator, "item_{d}", .{i});
+        defer allocator.free(id);
+
+        var vec = [_]f32{ @as(f32, @floatFromInt(i)), @as(f32, @floatFromInt(i + 1)), @as(f32, @floatFromInt(i + 2)) };
+        try storage.putVector("iter_test", id, &vec);
+    }
+
+    var iter = try storage.iterateCollection("iter_test");
+    defer iter.deinit();
+
+    var count: usize = 0;
+    while (try iter.next()) |entry| {
+        defer allocator.free(entry.id);
+        defer allocator.free(entry.vector);
+        count += 1;
+    }
+
+    try testing.expectEqual(@as(usize, 50), count);
+}
+
+test "storage: range delete" {
+    const source_file = @src().file;
+    const dir_path = std.fs.path.dirname(source_file) orelse ".";
+    const db_path = try std.fs.path.join(allocator, &.{ dir_path, ".test-storage-range" });
+    defer allocator.free(db_path);
+
+    std.fs.cwd().deleteTree(db_path) catch {};
+    defer std.fs.cwd().deleteTree(db_path) catch {};
+
+    var storage = try Storage.init(allocator, .{ .path = db_path });
+    defer storage.deinit();
+
+    try storage.open();
+
+    for (0..100) |i| {
+        const id = try std.fmt.allocPrint(allocator, "doc_{d}", .{i});
+        defer allocator.free(id);
+
+        var vec = [_]f32{@as(f32, @floatFromInt(i))};
+        try storage.putVector("deleteme", id, &vec);
+    }
+
+    const deleted_count = try storage.deleteRange("deleteme");
+    try testing.expectEqual(@as(usize, 100), deleted_count);
+
+    const check = try storage.getVector("deleteme", "doc_50");
+    defer if (check) |c| allocator.free(c);
+    try testing.expect(check == null);
+}
+
+test "storage: cache effectiveness" {
+    const source_file = @src().file;
+    const dir_path = std.fs.path.dirname(source_file) orelse ".";
+    const db_path = try std.fs.path.join(allocator, &.{ dir_path, ".test-storage-cache" });
+    defer allocator.free(db_path);
+
+    std.fs.cwd().deleteTree(db_path) catch {};
+    defer std.fs.cwd().deleteTree(db_path) catch {};
+
+    var storage = try Storage.init(allocator, .{
+        .path = db_path,
+        .enable_cache = true,
+        .cache_size = 10000,
+        .cache_ttl = 3600,
+    });
+    defer storage.deinit();
+
+    try storage.open();
+
+    try testing.expect(storage.vector_cache != null);
+
+    var vec = [_]f32{ 1.0, 2.0, 3.0 };
+    try storage.putVector("cached", "hot_vector", &vec);
+
+    const first = try storage.getVector("cached", "hot_vector");
+    try testing.expect(first != null);
+    defer allocator.free(first.?);
+
+    const second = try storage.getVector("cached", "hot_vector");
+    try testing.expect(second != null);
+    defer allocator.free(second.?);
+
+    const third = try storage.getVector("cached", "hot_vector");
+    try testing.expect(third != null);
+    defer allocator.free(third.?);
+
+    const hits = storage.metrics.cache_hits.load(.monotonic);
+    const misses = storage.metrics.cache_misses.load(.monotonic);
+    const total = hits + misses;
+
+    std.debug.print("\nCache effectiveness:\n", .{});
+    std.debug.print("  Hits: {d}\n", .{hits});
+    std.debug.print("  Misses: {d}\n", .{misses});
+    std.debug.print("  Total: {d}\n", .{total});
+
+    try testing.expect(total >= 3);
+    try testing.expect(hits >= 2);
 }

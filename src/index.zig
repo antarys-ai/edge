@@ -203,21 +203,30 @@ pub const VectorIndex = struct {
         const file = try std.fs.cwd().createFile(path, .{});
         defer file.close();
 
-        const writer = file.writer();
+        var buffer: [8192]u8 = undefined;
+        var writer: std.io.Writer = .fixed(&buffer);
 
         try writer.writeInt(usize, self.config.dimensions, .little);
         try writer.writeInt(u8, @intFromEnum(self.config.metric), .little);
         try writer.writeInt(u8, @intFromEnum(self.config.quantization), .little);
         try writer.writeInt(usize, self.config.connectivity, .little);
         try writer.writeInt(usize, self.id_map.next_key, .little);
-
         try writer.writeInt(usize, self.id_map.id_to_key.count(), .little);
+
+        try file.writeAll(writer.buffered());
 
         var it = self.id_map.id_to_key.iterator();
         while (it.next()) |entry| {
+            writer.end = 0;
+
             try writer.writeInt(usize, entry.key_ptr.len, .little);
-            try writer.writeAll(entry.key_ptr.*);
+            try file.writeAll(writer.buffered());
+
+            try file.writeAll(entry.key_ptr.*);
+
+            writer.end = 0;
             try writer.writeInt(u64, entry.value_ptr.*, .little);
+            try file.writeAll(writer.buffered());
         }
     }
 
@@ -225,24 +234,34 @@ pub const VectorIndex = struct {
         const file = try std.fs.cwd().openFile(path, .{});
         defer file.close();
 
-        const reader = file.reader();
+        var buffer: [8192]u8 = undefined;
 
-        _ = try reader.readInt(usize, .little);
-        _ = try reader.readInt(u8, .little);
-        _ = try reader.readInt(u8, .little);
-        _ = try reader.readInt(usize, .little);
+        const header_size = @sizeOf(usize) * 6 + @sizeOf(u8) * 2;
+        const bytes_read = try file.readAll(buffer[0..header_size]);
+        if (bytes_read < header_size) return error.UnexpectedEndOfFile;
 
-        self.id_map.next_key = try reader.readInt(usize, .little);
+        var reader: std.io.Reader = .fixed(buffer[0..bytes_read]);
 
-        const count = try reader.readInt(usize, .little);
+        _ = try reader.takeInt(usize, .little);
+        _ = try reader.takeInt(u8, .little);
+        _ = try reader.takeInt(u8, .little);
+        _ = try reader.takeInt(usize, .little);
+
+        self.id_map.next_key = try reader.takeInt(usize, .little);
+        const count = try reader.takeInt(usize, .little);
 
         for (0..count) |_| {
-            const id_len = try reader.readInt(usize, .little);
+            _ = try file.readAll(buffer[0..@sizeOf(usize)]);
+            reader = .fixed(buffer[0..@sizeOf(usize)]);
+            const id_len = try reader.takeInt(usize, .little);
+
             const id = try self.allocator.alloc(u8, id_len);
             errdefer self.allocator.free(id);
+            _ = try file.readAll(id);
 
-            _ = try reader.readAll(id);
-            const key = try reader.readInt(u64, .little);
+            _ = try file.readAll(buffer[0..@sizeOf(u64)]);
+            reader = .fixed(buffer[0..@sizeOf(u64)]);
+            const key = try reader.takeInt(u64, .little);
 
             try self.id_map.id_to_key.put(id, key);
             try self.id_map.key_to_id.put(key, id);
