@@ -388,7 +388,6 @@ pub const ThreadPool = struct {
         // Only supported on Linux and Windows
         switch (builtin.os.tag) {
             .linux => try setLinuxAffinity(thread, worker_id, total_workers),
-            .windows => try setWindowsAffinity(thread, worker_id, total_workers),
             else => {}, // Unsupported platform - silently ignore
         }
     }
@@ -418,26 +417,6 @@ pub const ThreadPool = struct {
         const result = c.pthread_setaffinity_np(pthread_handle, @sizeOf(c.cpu_set_t), &cpu_set);
 
         if (result != 0) {
-            return error.AffinitySetFailed;
-        }
-    }
-
-    fn setWindowsAffinity(thread: std.Thread, worker_id: usize, total_workers: usize) !void {
-        if (builtin.os.tag != .windows) return;
-
-        const windows = std.os.windows;
-        const cpu_count = std.Thread.getCpuCount() catch return;
-
-        // Distribute workers across available CPUs
-        const cpu_id = (worker_id * cpu_count) / total_workers;
-
-        // Create affinity mask for single CPU
-        const affinity_mask: windows.DWORD_PTR = @as(windows.DWORD_PTR, 1) << @intCast(cpu_id);
-
-        const thread_handle = thread.getHandle();
-        const prev_mask = windows.kernel32.SetThreadAffinityMask(thread_handle, affinity_mask);
-
-        if (prev_mask == 0) {
             return error.AffinitySetFailed;
         }
     }
@@ -582,10 +561,9 @@ pub const NumaAllocator = struct {
     fn alloc(ctx: *anyopaque, len: usize, ptr_align: u8, ret_addr: usize) ?[*]u8 {
         const self: *NumaAllocator = @ptrCast(@alignCast(ctx));
 
-        // If NUMA node specified and on Linux, try numa_alloc_onnode
+        // TODO - If NUMA node specified and on Linux, try numa_alloc_onnode
         if (builtin.os.tag == .linux and self.node != null) {
-            // For production, use libnuma bindings here
-            // For now, fall back to regular allocation
+            // NOTE - For production, use libnuma bindings here
         }
 
         return self.backing_allocator.rawAlloc(len, ptr_align, ret_addr);
