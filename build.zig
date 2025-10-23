@@ -25,6 +25,16 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const httpz = b.dependency("httpz", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
+    exe.root_module.addImport("httpz", httpz.module("httpz"));
+
+    const bindings = b.dependency("rocksdb", .{}).module("bindings");
+    exe.root_module.addImport("rocksdb", bindings);
+
     const usearch_module = b.createModule(.{
         .target = target,
         .optimize = optimize,

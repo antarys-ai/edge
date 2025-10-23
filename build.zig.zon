@@ -3,7 +3,16 @@
     .version = "0.0.0",
     .fingerprint = 0x8a08c3293feaffbc,
     .minimum_zig_version = "0.15.1",
-    .dependencies = .{},
+    .dependencies = .{
+        .rocksdb = .{
+            .url = "git+https://github.com/pacifio/rocksdb.git/?ref=main#f0a5ee2a74060b877a9c3b5d516a7f2dd84a742f",
+            .hash = "rocksdb-9.8.0-z_CUTp64AAC9RVaFcmhqWMFIukXHjlNHGs1iZnFcE8xr",
+        },
+        .httpz = .{
+            .url = "git+https://github.com/karlseguin/http.zig?ref=master#5e5ab5f82477252fd85943bcb33db483bde6de86",
+            .hash = "httpz-0.0.0-PNVzrLndBgBwKYPO0v3OFD-6741_9uKdWtU27sil2-df",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

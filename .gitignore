@@ -1,3 +1,8 @@
 zig-cache/
 zig-out/
 .zig-cache/
+
+.DS_Store
+**/.DS_Store
+
+data/*
