@@ -6,8 +6,8 @@ You can also use this as the starting point to build a vector db for yourself if
 
 This uses [Usearch](https://github.com/unum-cloud/USearch) for HNSW indexing and searching, this is not the same as our [proprietary search engine](https://docs.antarys.ai/docs#ahnsw-algorithm). To help support this project, we built binding libraries for zig.
 
-> uSearch
-> rocksdb (forked from rocksdb-zig for 0.15.1)
+- uSearch
+- rocksdb (forked from rocksdb-zig for 0.15.1)
 
 To get started clone the project
 
