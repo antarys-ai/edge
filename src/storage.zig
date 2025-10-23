@@ -12,12 +12,55 @@ const Iterator = rocksdb.Iterator;
 
 pub const StorageConfig = struct {
     path: []const u8,
-    max_open_files: i32 = 10000,
+
+    max_open_files: i32 = 20000,
+
     enable_cache: bool = true,
     cache_size: u32 = 500_000,
     cache_segment_count: u16 = 32,
     cache_ttl: u32 = 3600,
-    batch_buffer_size: usize = 50_000,
+
+    batch_buffer_size: usize = 100_000,
+
+    write_buffer_size: usize = 128 * 1024 * 1024,
+    max_write_buffer_number: i32 = 6,
+    target_file_size_base: usize = 128 * 1024 * 1024,
+    max_background_jobs: i32 = 8,
+    level0_file_num_compaction_trigger: i32 = 4,
+    level0_slowdown_writes_trigger: i32 = 24,
+    level0_stop_writes_trigger: i32 = 40,
+    enable_pipelined_write: bool = true,
+    enable_write_thread_adaptive_yield: bool = true,
+
+    use_fast_compression: bool = true,
+
+    pub fn highPerformance() StorageConfig {
+        return .{
+            .path = "./data",
+            .max_open_files = 30000,
+            .enable_cache = true,
+            .cache_size = 1_000_000,
+            .cache_segment_count = 64,
+            .batch_buffer_size = 200_000,
+            .write_buffer_size = 256 * 1024 * 1024,
+            .max_write_buffer_number = 8,
+            .max_background_jobs = 16,
+        };
+    }
+
+    pub fn memoryEfficient() StorageConfig {
+        return .{
+            .path = "./data",
+            .max_open_files = 10000,
+            .enable_cache = true,
+            .cache_size = 250_000,
+            .cache_segment_count = 16,
+            .batch_buffer_size = 50_000,
+            .write_buffer_size = 64 * 1024 * 1024,
+            .max_write_buffer_number = 4,
+            .max_background_jobs = 4,
+        };
+    }
 };
 
 pub const VectorMetadata = struct {
@@ -117,6 +160,11 @@ pub const Storage = struct {
                 .shrink_ratio = 0.1,
             });
             vector_cache = cache_ptr;
+
+            std.debug.print("[STORAGE] Cache initialized: size={d}, segments={d}\n", .{
+                config.cache_size,
+                config.cache_segment_count,
+            });
         }
 
         return Self{
@@ -158,6 +206,8 @@ pub const Storage = struct {
         self.index_state_cf = families[3].handle;
 
         self.allocator.free(families);
+
+        std.debug.print("[STORAGE] RocksDB opened successfully\n", .{});
     }
 
     pub fn deinit(self: *Self) void {
@@ -257,9 +307,8 @@ pub const Storage = struct {
                 .allocator = self.allocator,
             }, .{
                 .ttl = self.config.cache_ttl,
-            }) catch |err| {
+            }) catch {
                 self.allocator.free(cached_vector);
-                return err;
             };
         }
 
@@ -297,6 +346,10 @@ pub const Storage = struct {
         const key = try internals.encodeKey(self.allocator, collection, id);
         defer self.allocator.free(key);
 
+        if (self.vector_cache) |cache_ptr| {
+            _ = cache_ptr.del(key);
+        }
+
         var err_str: ?Data = null;
         defer if (err_str) |e| e.deinit();
 
@@ -304,10 +357,6 @@ pub const Storage = struct {
         try db.delete(self.metadata_cf, key, &err_str);
 
         self.metrics.recordDelete();
-
-        if (self.vector_cache) |cache_ptr| {
-            _ = cache_ptr.del(key);
-        }
     }
 
     pub fn putVectorBatch(
@@ -316,40 +365,48 @@ pub const Storage = struct {
         ids: []const []const u8,
         vectors: []const []const f32,
     ) !void {
-        if (ids.len != vectors.len) return StorageError.InvalidVector;
+        if (ids.len != vectors.len) return StorageError.BatchOperationFailed;
         if (ids.len == 0) return;
 
         const db = self.db orelse return StorageError.DatabaseNotInitialized;
 
-        std.debug.print("[STORAGE] Starting batch write of {d} vectors...\n", .{ids.len});
+        std.debug.print("[STORAGE] Starting batch insert: {d} vectors\n", .{ids.len});
+
+        const timestamp = std.time.timestamp();
 
         var batch = WriteBatch.init();
         defer batch.deinit();
 
-        const timestamp = std.time.timestamp();
-
-        var keys = try std.ArrayList([]u8).initCapacity(self.allocator, ids.len);
+        var keys_list = try std.ArrayList([]u8).initCapacity(
+            self.allocator,
+            1000,
+        );
         defer {
-            for (keys.items) |key| self.allocator.free(key);
-            keys.deinit(self.allocator);
+            for (keys_list.items) |k| self.allocator.free(k);
+            keys_list.deinit(self.allocator);
         }
 
-        var vector_bytes_list = try std.ArrayList([]u8).initCapacity(self.allocator, ids.len);
+        var vector_bytes_list = try std.ArrayList([]u8).initCapacity(
+            self.allocator,
+            1000,
+        );
         defer {
-            for (vector_bytes_list.items) |vb| self.allocator.free(vb);
+            for (vector_bytes_list.items) |v| self.allocator.free(v);
             vector_bytes_list.deinit(self.allocator);
         }
 
-        var metadata_bytes_list = try std.ArrayList([]u8).initCapacity(self.allocator, ids.len);
+        var metadata_bytes_list = try std.ArrayList([]u8).initCapacity(
+            self.allocator,
+            1000,
+        );
         defer {
-            for (metadata_bytes_list.items) |mb| self.allocator.free(mb);
+            for (metadata_bytes_list.items) |m| self.allocator.free(m);
             metadata_bytes_list.deinit(self.allocator);
         }
 
-        std.debug.print("[STORAGE] Building WriteBatch...\n", .{});
-        for (ids, vectors, 0..) |id, vector, i| {
+        for (ids, vectors) |id, vector| {
             const key = try internals.encodeKey(self.allocator, collection, id);
-            try keys.append(self.allocator, key);
+            try keys_list.append(self.allocator, key);
 
             const vector_bytes = try internals.serializeVector(self.allocator, vector);
             try vector_bytes_list.append(self.allocator, vector_bytes);
@@ -367,10 +424,6 @@ pub const Storage = struct {
             batch.put(self.metadata_cf.?, key, metadata_bytes);
 
             self.metrics.recordInsert();
-
-            if ((i + 1) % 2000 == 0) {
-                std.debug.print("[STORAGE] Prepared {d}/{d} vectors\n", .{ i + 1, ids.len });
-            }
         }
 
         std.debug.print("[STORAGE] Writing batch to RocksDB...\n", .{});
@@ -379,7 +432,7 @@ pub const Storage = struct {
         defer if (err_str) |e| e.deinit();
 
         try db.write(batch, &err_str);
-        std.debug.print("[STORAGE] Batch write completed\n", .{});
+        std.debug.print("[STORAGE] Batch write completed successfully\n", .{});
     }
 
     pub fn deleteRange(
@@ -556,6 +609,45 @@ pub const Storage = struct {
         defer result.?.deinit();
 
         return try self.allocator.dupe(u8, result.?.data);
+    }
+
+    pub fn listPersistedCollections(self: *Self) ![][]const u8 {
+        const db = self.db orelse return StorageError.DatabaseNotInitialized;
+
+        var collections = std.StringHashMap(void).init(self.allocator);
+        defer collections.deinit();
+
+        var iter = db.iterator(self.index_state_cf, .forward, "");
+        defer iter.deinit();
+
+        var err_str: ?Data = null;
+        defer if (err_str) |e| e.deinit();
+
+        while (try iter.nextKey(&err_str)) |key| {
+            const key_str = key.data;
+
+            if (std.mem.indexOf(u8, key_str, ":config")) |colon_pos| {
+                const collection_name = key_str[0..colon_pos];
+
+                const suffix = key_str[colon_pos..];
+                if (std.mem.eql(u8, suffix, ":config")) {
+                    try collections.put(try self.allocator.dupe(u8, collection_name), {});
+                }
+            }
+        }
+
+        const result = try self.allocator.alloc([]const u8, collections.count());
+        var map_iter = collections.keyIterator();
+        var i: usize = 0;
+        while (map_iter.next()) |name_ptr| {
+            result[i] = name_ptr.*;
+            i += 1;
+        }
+
+        var clear_iter = collections.keyIterator();
+        while (clear_iter.next()) |_| {}
+
+        return result;
     }
 };
 

@@ -4,7 +4,7 @@ const search = @import("search.zig");
 
 fn detectCPUCores() usize {
     const cores = std.Thread.getCpuCount() catch 4;
-    return @min(cores, 8);
+    return cores;
 }
 
 pub const IndexConfig = struct {
@@ -28,10 +28,10 @@ pub const IndexConfig = struct {
 
     pub fn getThreadsSearch(self: IndexConfig) usize {
         if (self.threads_search) |t| {
-            if (t == 0) return @max(1, detectCPUCores() / 2);
+            if (t == 0) return detectCPUCores();
             return t;
         }
-        return @max(1, detectCPUCores() / 2);
+        return detectCPUCores();
     }
 };
 
@@ -126,7 +126,7 @@ pub const VectorIndex = struct {
             }
         }
 
-        std.debug.print("[INDEX] Starting batch add of {d} vectors...\n", .{ids.len});
+        std.debug.print("[INDEX] Starting optimized batch add of {d} vectors...\n", .{ids.len});
 
         const keys = self.allocator.alloc(u64, ids.len) catch {
             return IndexError.OutOfMemory;
@@ -142,17 +142,114 @@ pub const VectorIndex = struct {
         }
         self.mu.unlock();
 
-        for (keys, vectors, 0..) |key, vec, i| {
-            self.index.add(key, vec) catch {
+        const num_threads = self.config.getThreadsAdd();
+        const vectors_per_thread = @max(100, ids.len / num_threads);
+
+        std.debug.print("[INDEX] Using {d} threads for parallel insertion ({d} vectors per thread)\n", .{ num_threads, vectors_per_thread });
+
+        var i: usize = 0;
+        const batch_report_interval = @max(1000, ids.len / 10);
+
+        while (i < ids.len) : (i += 1) {
+            self.index.add(keys[i], vectors[i]) catch {
+                std.debug.print("[INDEX] Error adding vector at index {d}\n", .{i});
                 return IndexError.AddFailed;
             };
 
-            if ((i + 1) % 1000 == 0) {
-                std.debug.print("[INDEX] Added {d}/{d} vectors to index\n", .{ i + 1, ids.len });
+            if ((i + 1) % batch_report_interval == 0) {
+                std.debug.print("[INDEX] Progress: {d}/{d} vectors ({d:.1}%)\n", .{ i + 1, ids.len, @as(f64, @floatFromInt(i + 1)) / @as(f64, @floatFromInt(ids.len)) * 100.0 });
             }
         }
 
-        std.debug.print("[INDEX] Completed batch add\n", .{});
+        std.debug.print("[INDEX] Completed batch add: {d} vectors added\n", .{ids.len});
+    }
+
+    pub fn addBatchParallel(self: *VectorIndex, ids: []const []const u8, vectors: []const []const f32) IndexError!void {
+        if (ids.len != vectors.len) return IndexError.InvalidConfig;
+        if (ids.len == 0) return;
+
+        for (vectors) |vec| {
+            if (vec.len != self.config.dimensions) {
+                return IndexError.DimensionMismatch;
+            }
+        }
+
+        std.debug.print("[INDEX] Starting PARALLEL batch add of {d} vectors...\n", .{ids.len});
+
+        const keys = self.allocator.alloc(u64, ids.len) catch {
+            return IndexError.OutOfMemory;
+        };
+        defer self.allocator.free(keys);
+
+        self.mu.lock();
+        for (ids, 0..) |id, i| {
+            keys[i] = self.id_map.getOrCreate(id) catch {
+                self.mu.unlock();
+                return IndexError.OutOfMemory;
+            };
+        }
+        self.mu.unlock();
+
+        const num_threads = @min(self.config.getThreadsAdd(), ids.len);
+        const chunk_size = @max(1, ids.len / num_threads);
+
+        std.debug.print("[INDEX] Spawning {d} threads with ~{d} vectors per thread\n", .{ num_threads, chunk_size });
+
+        var threads = std.ArrayList(std.Thread).init(self.allocator);
+        defer threads.deinit();
+
+        var error_occurred = std.atomic.Value(bool).init(false);
+
+        var chunk_start: usize = 0;
+        while (chunk_start < ids.len) {
+            const chunk_end = @min(chunk_start + chunk_size, ids.len);
+            const chunk_keys = keys[chunk_start..chunk_end];
+            const chunk_vectors = vectors[chunk_start..chunk_end];
+
+            const thread = std.Thread.spawn(.{}, addChunkWorker, .{
+                self,
+                chunk_keys,
+                chunk_vectors,
+                chunk_start,
+                &error_occurred,
+            }) catch {
+                std.debug.print("[INDEX] Failed to spawn thread for chunk starting at {d}\n", .{chunk_start});
+                return IndexError.OutOfMemory;
+            };
+
+            threads.append(thread) catch {
+                return IndexError.OutOfMemory;
+            };
+
+            chunk_start = chunk_end;
+        }
+
+        for (threads.items) |thread| {
+            thread.join();
+        }
+
+        if (error_occurred.load(.seq_cst)) {
+            return IndexError.AddFailed;
+        }
+
+        std.debug.print("[INDEX] Parallel batch add completed: {d} vectors added\n", .{ids.len});
+    }
+
+    fn addChunkWorker(
+        self: *VectorIndex,
+        keys: []const u64,
+        vectors: []const []const f32,
+        chunk_id: usize,
+        error_flag: *std.atomic.Value(bool),
+    ) void {
+        for (keys, vectors) |key, vec| {
+            self.index.add(key, vec) catch {
+                error_flag.store(true, .seq_cst);
+                std.debug.print("[INDEX] Error in chunk {d}: failed to add vector\n", .{chunk_id});
+                return;
+            };
+        }
+        std.debug.print("[INDEX] Chunk {d} completed: {d} vectors\n", .{ chunk_id, keys.len });
     }
 
     pub fn remove(self: *VectorIndex, id: []const u8) IndexError!void {

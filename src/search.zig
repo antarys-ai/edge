@@ -97,7 +97,7 @@ pub fn search(
 }
 
 pub fn batchSearch(
-    index: *const usearch.Index,
+    index: *usearch.Index,
     queries: []const []const f32,
     options: SearchOptions,
     id_map: *const IdMap,

@@ -116,12 +116,106 @@ pub const AntarysDB = struct {
 
         try store.open();
 
-        return Self{
+        var self = Self{
             .allocator = allocator,
             .store = store,
             .collections = std.StringHashMap(Collection).init(allocator),
             .collections_lock = .{},
             .config = config,
+        };
+
+        try self.loadAll();
+
+        return self;
+    }
+
+    pub fn loadAll(self: *Self) !void {
+        const collection_names = try self.store.listPersistedCollections();
+        defer {
+            for (collection_names) |name| {
+                self.allocator.free(name);
+            }
+            self.allocator.free(collection_names);
+        }
+
+        if (collection_names.len == 0) {
+            return;
+        }
+
+        for (collection_names) |name| {
+            const config_data = try self.store.getIndexState(name, "config");
+            if (config_data == null) {
+                continue;
+            }
+            defer self.allocator.free(config_data.?);
+
+            const config = try self.parseCollectionConfig(config_data.?);
+
+            var col = try Collection.init(self.allocator, name, config);
+            errdefer col.deinit(self.allocator);
+
+            const index_path = try std.fmt.allocPrint(
+                self.allocator,
+                "{s}/{s}.index",
+                .{ self.config.storage_path, name },
+            );
+            defer self.allocator.free(index_path);
+
+            std.fs.cwd().access(index_path, .{}) catch |err| {
+                if (err == error.FileNotFound) {
+                    try self.collections.put(try self.allocator.dupe(u8, name), col);
+                    continue;
+                } else {
+                    return err;
+                }
+            };
+
+            col.idx.loadIndex(index_path) catch |err| {
+                _ = err;
+                try self.collections.put(try self.allocator.dupe(u8, name), col);
+                continue;
+            };
+
+            self.loadIdMap(name, &col.idx.id_map) catch |err| {
+                _ = err;
+            };
+
+            try self.collections.put(try self.allocator.dupe(u8, name), col);
+        }
+    }
+
+    fn parseCollectionConfig(self: *Self, config_json: []const u8) !CollectionConfig {
+        _ = self;
+
+        var dimensions: usize = 1536;
+        var metric: usearch.Metric = .cosine;
+        var quantization: usearch.Quantization = .f32;
+
+        var iter = std.mem.tokenizeAny(u8, config_json, "{},:\"");
+        while (iter.next()) |token| {
+            if (std.mem.eql(u8, token, "dimensions")) {
+                if (iter.next()) |val| {
+                    dimensions = try std.fmt.parseInt(usize, val, 10);
+                }
+            } else if (std.mem.eql(u8, token, "metric")) {
+                if (iter.next()) |val| {
+                    metric = std.meta.stringToEnum(usearch.Metric, val) orelse .cosine;
+                }
+            } else if (std.mem.eql(u8, token, "quantization")) {
+                if (iter.next()) |val| {
+                    quantization = std.meta.stringToEnum(usearch.Quantization, val) orelse .f32;
+                }
+            }
+        }
+
+        return CollectionConfig{
+            .dimensions = dimensions,
+            .metric = metric,
+            .quantization = quantization,
+            .connectivity = 16,
+            .expansion_add = 128,
+            .expansion_search = 64,
+            .enable_persistence = true,
         };
     }
 
@@ -218,6 +312,7 @@ pub const AntarysDB = struct {
         }
 
         try col.idx.addBatch(ids, vectors);
+
         try self.store.putVectorBatch(collection_name, ids, vectors);
     }
 
@@ -299,12 +394,16 @@ pub const AntarysDB = struct {
 
         const index_path = try std.fmt.allocPrint(
             self.allocator,
-            "{s}/{s}.usearch",
+            "{s}/{s}.index",
             .{ self.config.storage_path, collection_name },
         );
+
         defer self.allocator.free(index_path);
 
-        try col.idx.saveIndex(index_path);
+        col.idx.saveIndex(index_path) catch |err| {
+            return err;
+        };
+
         try self.saveIdMap(collection_name, &col.idx.id_map);
     }
 
@@ -316,7 +415,7 @@ pub const AntarysDB = struct {
 
         const index_path = try std.fmt.allocPrint(
             self.allocator,
-            "{s}/{s}.usearch",
+            "{s}/{s}.index",
             .{ self.config.storage_path, collection_name },
         );
         defer self.allocator.free(index_path);
@@ -327,11 +426,24 @@ pub const AntarysDB = struct {
 
     pub fn saveAll(self: *Self) !void {
         self.collections_lock.lockShared();
-        defer self.collections_lock.unlockShared();
+
+        var names = try self.allocator.alloc([]const u8, self.collections.count());
+        defer self.allocator.free(names);
 
         var iter = self.collections.keyIterator();
+        var i: usize = 0;
         while (iter.next()) |name| {
-            try self.saveCollection(name.*);
+            names[i] = name.*;
+            i += 1;
+        }
+
+        self.collections_lock.unlockShared();
+
+        for (names) |name| {
+            self.saveCollection(name) catch |err| {
+                _ = err;
+                continue;
+            };
         }
 
         try self.store.flush();
