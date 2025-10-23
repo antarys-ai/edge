@@ -171,13 +171,13 @@ pub const AntarysDB = struct {
             };
 
             col.idx.loadIndex(index_path) catch |err| {
-                _ = err;
+                std.debug.print("[DB] Load index failed with error {}\n", .{err});
                 try self.collections.put(try self.allocator.dupe(u8, name), col);
                 continue;
             };
 
             self.loadIdMap(name, &col.idx.id_map) catch |err| {
-                _ = err;
+                std.debug.print("[DB] Load id map failed with error {}\n", .{err});
             };
 
             try self.collections.put(try self.allocator.dupe(u8, name), col);
@@ -441,7 +441,10 @@ pub const AntarysDB = struct {
 
         for (names) |name| {
             self.saveCollection(name) catch |err| {
-                _ = err;
+                std.debug.print("[DB] save collection failed for collection - {s} with error {}\n", .{
+                    name,
+                    err,
+                });
                 continue;
             };
         }

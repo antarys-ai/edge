@@ -1,6 +1,111 @@
 ## Antarys Edge
 
-Next generation Antarys vector db backed by Usearch HNSW and RocksDB for scale.
+Antarys vector db (lite) built on top of [Usearch](https://github.com/unum-cloud/USearch) and [RocksDB](https://github.com/pacifio/rocksdb) and [http.zig](https://github.com/karlseguin/http.zig/) for small to medium sized projects. This version of Antarys also supports our standard python/nodejs clients with compatible APIs (only vector operations, embedding support planned)
+
+You can also use this as the starting point to build a vector db for yourself if you are using zig 0.15.1
+
+This uses [Usearch](https://github.com/unum-cloud/USearch) for HNSW indexing and searching, this is not the same as our [proprietary search engine](https://docs.antarys.ai/docs#ahnsw-algorithm). To help support this project, we built binding libraries for zig.
+
+> uSearch
+> rocksdb (forked from rocksdb-zig for 0.15.1)
+
+To get started clone the project
+
+```bash
+git clone https://github.com/antarys-ai/edge.git
+cd edge
+zig build
+zig build run
+```
+
+Only tested on Apple ARM, zig build for production has some issues with [UBSan](https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html) due to rocksdb, you can build debug builds on mac but it might throw a linker dump error. Please submit issues for other platforms as well.
+
+### Usearch Bindings
+
+```zig
+pub fn search(
+    index: *usearch.Index,
+    query: []const f32,
+    options: SearchOptions,
+    id_map: *const IdMap,
+    allocator: std.mem.Allocator,
+) SearchError![]SearchResult {
+    if (query.len == 0) return SearchError.EmptyQuery;
+
+    if (options.expansion) |exp| {
+        index.setExpansionSearch(exp) catch {};
+    }
+
+    if (options.threads) |threads| {
+        index.setThreadsSearch(threads) catch {};
+    }
+
+    const raw_results = index.search(query, options.limit) catch |err| {
+        return switch (err) {
+            error.IndexUninitialized => SearchError.IndexUninitialized,
+            error.EmptyVector => SearchError.EmptyQuery,
+            error.DimensionMismatch => SearchError.InvalidDimensions,
+            else => SearchError.SearchFailed,
+        };
+    };
+    defer allocator.free(raw_results);
+
+    var results = try std.ArrayList(SearchResult).initCapacity(allocator, 100);
+    errdefer {
+        for (results.items) |*r| r.deinit(allocator);
+        results.deinit(allocator);
+    }
+
+    for (raw_results) |raw| {
+        if (options.filter) |filter_fn| {
+            if (!filter_fn(raw.key)) continue;
+        }
+
+        const id = id_map.get(raw.key) orelse continue;
+        const id_copy = try allocator.dupe(u8, id);
+
+        var vec: ?[]f32 = null;
+        if (options.include_vectors) {
+            if (index.get(raw.key, 1)) |v| {
+                vec = v;
+            } else |_| {}
+        }
+
+        try results.append(allocator, .{
+            .id = id_copy,
+            .distance = raw.distance,
+            .vector = vec,
+        });
+    }
+
+    return results.toOwnedSlice(allocator);
+}
+```
+
+### Vector DB functions
+
+```zig
+const db_path = ".test-antarysdb-basic";
+
+std.debug.print("→ Initializing database...\n", .{});
+var db = try AntarysDB.init(allocator, .{
+    .storage_path = db_path,
+    .enable_cache = true,
+});
+defer db.deinit();
+
+std.debug.print("→ Creating collection...\n", .{});
+try db.createCollection("vectors", .{
+    .dimensions = 128,
+    .metric = .cosine,
+});
+
+if (!db.hasCollection("vectors")) {
+    std.debug.print("ERROR: Collection not found!\n", .{});
+    return error.TestFailed;
+}
+std.debug.print("Collection created\n", .{});
+```
 
 ### Internal ThreadPool API
 
@@ -32,17 +137,9 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    std.debug.print("\nExample 1: Basic ThreadPool \n", .{});
     try basicExample(allocator);
-
-    std.debug.print("\nExample 2: Batch Coordinator \n", .{});
     try batchExample(allocator);
-
-    std.debug.print("\nExample 3: Work Stealing \n", .{});
     try workStealingExample(allocator);
-
-    std.debug.print("\nExample 4: NUMA Configuration \n", .{});
-    try numaExample(allocator);
 }
 
 fn basicExample(allocator: std.mem.Allocator) !void {
@@ -171,55 +268,6 @@ fn workStealingExample(allocator: std.mem.Allocator) !void {
     std.debug.print("Work stealing example completed!\n", .{});
 }
 
-fn numaExample(allocator: std.mem.Allocator) !void {
-    const cpu_count = std.Thread.getCpuCount() catch 4;
-    std.debug.print("Detected {} CPUs\n", .{cpu_count});
-
-    var pool = try ThreadPool.init(allocator, .{
-        .num_workers = cpu_count,
-        .enable_affinity = false,
-        .local_queue_capacity = 64,
-        .global_queue_multiplier = 16,
-    });
-    defer pool.deinit();
-
-    std.debug.print("NUMA-aware pool initialized\n", .{});
-    std.debug.print("Thread affinity: enabled\n", .{});
-    std.debug.print("Workers: {}\n", .{pool.runningWorkers()});
-
-    const NumaTask = struct {
-        id: usize,
-
-        fn execute(ctx: *anyopaque) void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-
-            std.debug.print("NUMA task {} running\n", .{self.id});
-
-            var i: usize = 0;
-            while (i < 10000) : (i += 1) {}
-        }
-    };
-
-    var tasks: [16]NumaTask = undefined;
-    for (&tasks, 0..) |*task, i| {
-        task.* = .{ .id = i };
-        try pool.submit(NumaTask.execute, task);
-    }
-
-    pool.waitIdle();
-    std.debug.print("NUMA example completed!\n", .{});
-}
-
-fn numaAllocatorExample(allocator: std.mem.Allocator) !void {
-    const NumaAllocator = @import("threadpool.zig").NumaAllocator;
-
-    var numa_alloc = NumaAllocator.init(allocator, 0);
-    const numa_allocator = numa_alloc.allocator();
-
-    const data = try numa_allocator.alloc(u64, 1024);
-    defer numa_allocator.free(data);
-}
-
 const PoolStats = struct {
     start_time: i64,
     tasks_submitted: usize,
@@ -250,3 +298,7 @@ const PoolStats = struct {
     }
 };
 ```
+
+### Performance
+
+This version of Antarys is built for small teams experimenting with the [antarys client API](https://docs.antarys.ai/docs/python/), it uses HTTP1.1 protocol and it's not primarily built for performance, while it can perform quite close to Qdrant/Pinecone for search, indexing is still quite slow compared to others. It's using [Usearch](https://github.com/unum-cloud/USearch) internally for HNSW indexing and searching.

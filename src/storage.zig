@@ -206,8 +206,6 @@ pub const Storage = struct {
         self.index_state_cf = families[3].handle;
 
         self.allocator.free(families);
-
-        std.debug.print("[STORAGE] RocksDB opened successfully\n", .{});
     }
 
     pub fn deinit(self: *Self) void {

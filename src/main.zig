@@ -2,6 +2,10 @@ const std = @import("std");
 const api = @import("api.zig");
 const builtin = @import("builtin");
 
+const testkit = @import("tests/testkit.zig");
+
+const TESTING = false;
+
 const Config = struct {
     port: u16 = 8080,
     data_dir: []const u8 = "./data",
@@ -82,7 +86,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
 
 fn printUsage() void {
     const usage =
-        \\Antarys v0.4.0
+        \\Antarys Lite (edge) v0.1.0
         \\
         \\Usage: antarys [options]
         \\
@@ -100,6 +104,11 @@ fn printUsage() void {
 }
 
 pub fn main() !void {
+    if (TESTING) {
+        try testkit.testKit();
+        return;
+    }
+
     var gpa = std.heap.GeneralPurposeAllocator(.{
         .thread_safe = true,
         .safety = builtin.mode == .Debug,
